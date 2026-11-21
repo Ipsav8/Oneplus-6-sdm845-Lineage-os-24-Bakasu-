@@ -237,6 +237,10 @@ jobs:
           CONFIG_NET_SCH_FQ_CODEL=y
           CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y
           CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y
+          CONFIG_CPU_FREQ_GOV_PERFORMANCE=y
+          CONFIG_CPU_FREQ_GOV_POWERSAVE=y
+          CONFIG_CPU_FREQ_GOV_ONDEMAND=y
+          CONFIG_CPU_FREQ_GOV_CONSERVATIVE=y
           CONFIG_IOSCHED_BFQ=y
           CONFIG_MQ_IOSCHED_KYBER=y
           CONFIG_CRYPTO_LZ4=y
@@ -253,7 +257,7 @@ jobs:
           make $ARGS olddefconfig 2>&1 | tee -a build.log
           if [ "${{ inputs.performance }}" = "true" ]; then
             echo "--- performance options that stuck:"
-            grep -E "CONFIG_(PSI|TCP_CONG_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|CPU_FREQ_DEFAULT_GOV|IOSCHED_BFQ|MQ_IOSCHED_KYBER|CRYPTO_LZ4|ZRAM)[A-Z_]*[= ]|CONFIG_(SCHED_DEBUG|SCHEDSTATS|DEBUG_PREEMPT)[= ]" out/.config
+            grep -E "CONFIG_(PSI|TCP_CONG_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|CPU_FREQ_(DEFAULT_)?GOV|IOSCHED_BFQ|MQ_IOSCHED_KYBER|CRYPTO_LZ4|ZRAM)[A-Z_]*[= ]|CONFIG_(SCHED_DEBUG|SCHEDSTATS|DEBUG_PREEMPT)[= ]" out/.config
           fi
           grep -E "CONFIG_FUSE_BPF|CONFIG_MSM_VIDC_LEGACY_V4L2" out/.config
           if [ "${{ inputs.with_root }}" = "true" ]; then
@@ -330,9 +334,9 @@ jobs:
           cat > perfmod/module.prop << 'MEOF'
           id=op6_performance
           name=OP6 Performance Tweaks
-          version=1.2
-          versionCode=3
-          author=you
+          version=1.4
+          versionCode=5
+          author=Ipsa
           description=CPU/GPU, RAM and storage tuning for OnePlus 6 with a WebUI. Changes apply instantly and are re-applied at every boot.
           MEOF
           cat > perfmod/apply.sh << 'AEOF'
@@ -345,10 +349,13 @@ jobs:
           P0=$R/sys/devices/system/cpu/cpufreq/policy0
           P4=$R/sys/devices/system/cpu/cpufreq/policy4
           GPU=$R/sys/class/kgsl/kgsl-3d0/devfreq
-          KEYS="up down hl iow hf_l hf_b min_l max_l min_b max_b gpu_min gpu_max swap vfs pc ra iost sched eas"
+          MP=$R/data/adb/modules/op6_performance/module.prop
+          KEYS="gov_l gov_b up down hl iow hf_l hf_b min_l max_l min_b max_b gpu_min gpu_max swap vfs pc ra iost sched eas"
 
           paths() {
             case "$1" in
+              gov_l) echo $P0/scaling_governor ;;
+              gov_b) echo $P4/scaling_governor ;;
               up)    echo $P0/schedutil/up_rate_limit_us $P4/schedutil/up_rate_limit_us ;;
               down)  echo $P0/schedutil/down_rate_limit_us $P4/schedutil/down_rate_limit_us ;;
               hl)    echo $P0/schedutil/hispeed_load $P4/schedutil/hispeed_load ;;
@@ -379,6 +386,8 @@ jobs:
           }
           opts() {
             case "$1" in
+              gov_l) cat $P0/scaling_available_governors | tr ' ' '\n' | grep -vx userspace | tr '\n' ' ' ;;
+              gov_b) cat $P4/scaling_available_governors | tr ' ' '\n' | grep -vx userspace | tr '\n' ' ' ;;
               min_l|max_l|hf_l) cat $P0/scaling_available_frequencies ;;
               min_b|max_b|hf_b) cat $P4/scaling_available_frequencies ;;
               gpu_min|gpu_max)  cat $GPU/available_frequencies ;;
@@ -403,13 +412,14 @@ jobs:
             mv "$CONF.t" "$CONF"
           }
           delconf() { touch "$CONF"; grep -v "^$1=" "$CONF" > "$CONF.t" 2>/dev/null; mv "$CONF.t" "$CONF"; }
-          ensure_gov() {
-            for p in $P0 $P4; do
-              if [ "$(cat $p/scaling_governor 2>/dev/null)" != schedutil ] && grep -qw schedutil $p/scaling_available_governors 2>/dev/null; then
-                echo schedutil > $p/scaling_governor
-              fi
-            done
+          ensure_gov_one() {
+            # make sure schedutil is active unless the user picked another governor for this cluster
+            [ -n "$(getconf $2)" ] && return 0
+            if [ "$(cat $1/scaling_governor 2>/dev/null)" != schedutil ] && grep -qw schedutil $1/scaling_available_governors 2>/dev/null; then
+              echo schedutil > $1/scaling_governor
+            fi
           }
+          ensure_gov() { ensure_gov_one $P0 gov_l; ensure_gov_one $P4 gov_b; }
           preset_vals() {
             case "$1" in
               balanced)    echo "up=500 down=10000 hl=85 swap=80 vfs=80 pc=0 ra=512" ;;
@@ -423,10 +433,26 @@ jobs:
             for k in $KEYS; do v=$(stockv $k); [ -n "$v" ] && writek $k "$v"; done
           }
           apply_conf() {
+            # governors first, so the schedutil tunables exist before they are written
             while IFS='=' read -r k v; do
-              [ "$k" = preset ] && continue
-              [ -n "$k" ] && writek "$k" "$v"
+              case "$k" in gov_l|gov_b) writek "$k" "$v" ;; esac
             done < "$CONF"
+            while IFS='=' read -r k v; do
+              case "$k" in ''|preset|gov_l|gov_b) continue ;; esac
+              writek "$k" "$v"
+            done < "$CONF"
+          }
+
+          update_desc() {
+            # shows the active selection in the module list of the manager (module.prop is plain text, so a blue marker is used)
+            [ -w "$MP" ] || return 0
+            p=$(getconf preset); [ -z "$p" ] && p=balanced
+            case "$p" in
+              stock) n=Stock ;; balanced) n=Balanced ;; performance) n=Performance ;; battery) n=Battery ;; *) n=Custom ;;
+            esac
+            grep -v '^description=' "$MP" > "$MP.t" 2>/dev/null
+            echo "description=🔵 Active: $n | CPU/GPU, RAM and storage tuning for OnePlus 6 (open the module for the WebUI)" >> "$MP.t"
+            cat "$MP.t" > "$MP"; rm -f "$MP.t"
           }
 
           case "$1" in
@@ -437,6 +463,7 @@ jobs:
               echo "preset=$2" > "$CONF"
               [ "$2" != stock ] && ensure_gov
               for kv in $vals; do k=${kv%%=*}; v=${kv#*=}; writek $k $v; echo "$kv" >> "$CONF"; done
+              update_desc
               echo "applied $2" ;;
             set)
               k=$2; v=$3
@@ -451,6 +478,7 @@ jobs:
               fi
               [ -n "$v" ] && writek $k $v
               setconf preset custom
+              update_desc
               echo "set $k" ;;
             boot)
               ensure_stock
@@ -460,7 +488,8 @@ jobs:
                 [ "$(getconf preset)" != stock ] && ensure_gov
                 apply_conf
                 echo "boot applied $(getconf preset)"
-              fi ;;
+              fi
+              update_desc ;;
             status)
               ensure_stock
               p=$(getconf preset); [ -z "$p" ] && p=balanced
@@ -508,11 +537,13 @@ jobs:
           summary{font-size:16px;font-weight:600;padding:6px 0}
           h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;opacity:.6;margin:16px 0 4px}
           pre{white-space:pre-wrap;font-size:12px;margin:0;opacity:.8}
+          #cur{color:var(--acc);font-weight:700;font-size:17px;margin:0 0 10px}
           #msg{font-size:12px;height:16px;opacity:.8}
           </style></head><body>
           <h1>OP6 Performance</h1>
           <div class="sub">Changes apply instantly and are saved for every boot. <span id="msg"></span></div>
 
+          <div id="cur"></div>
           <div class="card">
           <div class="grid" id="presets"></div>
           </div>
@@ -520,7 +551,7 @@ jobs:
           <div class="card">
           <details><summary>Advanced tuning</summary>
           <div id="adv"></div>
-          <pre style="margin-top:14px">Frequency limits and some values can be overridden by the ROM while you use the phone. Setting a minimum frequency high raises battery drain. Pick Stock (or the Stock preset) to go back.</pre>
+          <pre style="margin-top:14px">Frequency limits and some values can be overridden by the ROM while you use the phone. The performance governor keeps the CPU at its top speed (hot, heavy battery use). Setting a minimum frequency high also raises battery drain. Pick Stock (or the Stock preset) to go back.</pre>
           </details>
           </div>
 
@@ -528,6 +559,9 @@ jobs:
           var DIR='/data/adb/modules/op6_performance';
           var PRESETS=[['stock','Stock','nothing applied'],['balanced','Balanced','default'],['performance','Performance','faster, more RAM kept'],['battery','Battery','slower ramp, saves power']];
           var CTRL=[
+           {sec:'CPU - governor'},
+           {k:'gov_l',t:'Little cluster governor',o:1},
+           {k:'gov_b',t:'Big cluster governor',o:1},
            {sec:'CPU - schedutil'},
            {k:'up',t:'Ramp-up delay (us)',c:[0,250,500,1000,2000]},
            {k:'down',t:'Ramp-down delay (us)',c:[5000,10000,20000,40000]},
@@ -591,6 +625,8 @@ jobs:
             });
           }
           function draw(){
+            var names={stock:'Stock',balanced:'Balanced',performance:'Performance',battery:'Battery',custom:'Custom'};
+            document.getElementById('cur').textContent='Active: '+(names[S.preset]||S.preset);
             var P=document.getElementById('presets');P.innerHTML='';
             PRESETS.forEach(function(p){
               var b=el('button',S.preset===p[0]?'on':'');
